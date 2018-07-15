@@ -137,8 +137,8 @@ class Processor {
 				$cb = $this->ready;
 				$this->out[] = null;
 			} else {
-				list($key, $cb) = each($this->onReady);
-				unset($this->onReady[$key]);
+				$cb = current($this->onReady);
+				unset($this->onReady[key($this->onReady)]);
 			}
 			if (isset($cb) && is_callable($cb)) {
 				$cb();
@@ -188,8 +188,8 @@ class Processor {
 
 	/** @return Deferred */
 	private function getDeferred() {
-		list($key, $deferred) = each($this->deferreds);
-		unset($this->deferreds[$key]);
+		$deferred = current($this->deferreds);
+		unset($this->deferreds[key($this->deferreds)]);
 		return $deferred;
 	}
 
@@ -221,7 +221,7 @@ class Processor {
 
 	public function setQuery($query) {
 		$this->query = $query;
-		$this->packetCallback = [$this, "handleQuery"];
+		$this->parseCallback = [$this, "handleQuery"];
 	}
 
 	public function setPrepare($query) {
@@ -322,6 +322,7 @@ class Processor {
 			$this->out[] = null;
 			$this->deferreds[] = $deferred;
 			$this->sendPacket($payload);
+			// apparently LOAD DATA LOCAL INFILE requests are not supported via prepared statements
 			$this->packetCallback = [$this, "handleExecute"];
 		});
 		return $deferred->promise(); // do not use $this->startCommand(), that might unexpectedly reset the seqId!
@@ -376,7 +377,7 @@ class Processor {
 	private function handleError($packet) {
 		$off = 1;
 
-		$this->connInfo->errorCode = DataTypes::decode_int16(substr($packet, $off, 2));
+		$this->connInfo->errorCode = DataTypes::decode_unsigned16(substr($packet, $off, 2));
 		$off += 2;
 
 		if ($this->capabilities & self::CLIENT_PROTOCOL_41) {
@@ -407,17 +408,17 @@ class Processor {
 	private function parseOk($packet) {
 		$off = 1;
 
-		$this->connInfo->affectedRows = DataTypes::decodeInt(substr($packet, $off), $intlen);
+		$this->connInfo->affectedRows = DataTypes::decodeUnsigned(substr($packet, $off), $intlen);
 		$off += $intlen;
 
-		$this->connInfo->insertId = DataTypes::decodeInt(substr($packet, $off), $intlen);
+		$this->connInfo->insertId = DataTypes::decodeUnsigned(substr($packet, $off), $intlen);
 		$off += $intlen;
 
 		if ($this->capabilities & (self::CLIENT_PROTOCOL_41 | self::CLIENT_TRANSACTIONS)) {
-			$this->connInfo->statusFlags = DataTypes::decode_int16(substr($packet, $off));
+			$this->connInfo->statusFlags = DataTypes::decode_unsigned16(substr($packet, $off));
 			$off += 2;
 
-			$this->connInfo->warnings = DataTypes::decode_int16(substr($packet, $off));
+			$this->connInfo->warnings = DataTypes::decode_unsigned16(substr($packet, $off));
 			$off += 2;
 		}
 
@@ -432,7 +433,7 @@ class Processor {
 					while ($len < $sessionStateLen) {
 						$data = DataTypes::decodeString(substr($sessionState, $len + 1), $datalen, $intlen);
 
-						switch ($type = DataTypes::decode_int8(substr($sessionState, $len))) {
+						switch ($type = DataTypes::decode_unsigned8(substr($sessionState, $len))) {
 							case SessionStateTypes::SESSION_TRACK_SYSTEM_VARIABLES:
 								$var = DataTypes::decodeString($data, $varintlen, $strlen);
 								$this->connInfo->sessionState[SessionStateTypes::SESSION_TRACK_SYSTEM_VARIABLES][$var] = DataTypes::decodeString(substr($data, $varintlen + $strlen));
@@ -467,9 +468,9 @@ class Processor {
 	/** @see 14.1.3.3 EOF-Packet */
 	private function parseEof($packet) {
 		if ($this->capabilities & self::CLIENT_PROTOCOL_41) {
-			$this->connInfo->warnings = DataTypes::decode_int16(substr($packet, 1));
+			$this->connInfo->warnings = DataTypes::decode_unsigned16(substr($packet, 1));
 
-			$this->connInfo->statusFlags = DataTypes::decode_int16(substr($packet, 3));
+			$this->connInfo->statusFlags = DataTypes::decode_unsigned16(substr($packet, 3));
 		}
 	}
 
@@ -491,7 +492,7 @@ class Processor {
 		$this->connInfo->serverVersion = DataTypes::decodeNullString(substr($packet, $off), $len);
 		$off += $len + 1;
 
-		$this->connectionId = DataTypes::decode_int32(substr($packet, $off));
+		$this->connectionId = DataTypes::decode_unsigned32(substr($packet, $off));
 		$off += 4;
 
 		$this->authPluginData = substr($packet, $off, 8);
@@ -499,17 +500,17 @@ class Processor {
 
 		$off += 1; // filler byte
 
-		$this->serverCapabilities = DataTypes::decode_int16(substr($packet, $off));
+		$this->serverCapabilities = DataTypes::decode_unsigned16(substr($packet, $off));
 		$off += 2;
 
 		if (\strlen($packet) > $off) {
 			$this->connInfo->charset = ord(substr($packet, $off));
 			$off += 1;
 
-			$this->connInfo->statusFlags = DataTypes::decode_int16(substr($packet, $off));
+			$this->connInfo->statusFlags = DataTypes::decode_unsigned16(substr($packet, $off));
 			$off += 2;
 
-			$this->serverCapabilities += DataTypes::decode_int16(substr($packet, $off)) << 16;
+			$this->serverCapabilities += DataTypes::decode_unsigned16(substr($packet, $off)) << 16;
 			$off += 2;
 
 			$this->authPluginDataLen = $this->serverCapabilities & self::CLIENT_PLUGIN_AUTH ? ord(substr($packet, $off)) : 0;
@@ -543,11 +544,32 @@ class Processor {
 
 	/** @see 14.6.4.1.1 Text Resultset */
 	private function handleQuery($packet) {
+		switch (\ord($packet)) {
+			case self::OK_PACKET:
+				$this->parseOk($packet);
+				if ($this->connInfo->statusFlags & StatusFlags::SERVER_MORE_RESULTS_EXISTS) {
+					$this->getDeferred()->succeed(new ResultSet($this->connInfo, $result = new ResultProxy));
+					$this->result = $result;
+					$result->updateState(ResultProxy::COLUMNS_FETCHED);
+					$this->successfulResultsetFetch();
+				} else {
+					$this->getDeferred()->succeed($this->getConnInfo());
+					$this->ready();
+				}
+				return;
+			case self::LOCAL_INFILE_REQUEST:
+				$this->handleLocalInfileRequest($packet);
+				return;
+			case self::ERR_PACKET:
+				$this->handleError($packet);
+				return;
+		}
+
 		$this->parseCallback = [$this, "handleTextColumnDefinition"];
 		$this->getDeferred()->succeed(new ResultSet($this->connInfo, $result = new ResultProxy));
 		/* we need to succeed before assigning vars, so that a when() handler won't have a partial result available */
 		$this->result = $result;
-		$this->result->setColumns(DataTypes::decodeInt($packet));
+		$result->setColumns(DataTypes::decodeUnsigned($packet));
 	}
 
 	/** @see 14.7.1 Binary Protocol Resultset */
@@ -556,7 +578,7 @@ class Processor {
 		$this->getDeferred()->succeed(new ResultSet($this->connInfo, $result = new ResultProxy));
 		/* we need to succeed before assigning vars, so that a when() handler won't have a partial result available */
 		$this->result = $result;
-		$this->result->setColumns(ord($packet));
+		$result->setColumns(ord($packet));
 	}
 
 	private function handleFieldList($packet) {
@@ -619,9 +641,9 @@ class Processor {
 	private function prepareFields($packet) {
 		if (!$this->result->columnsToFetch--) {
 			$this->parseCallback = null;
-			$this->result->updateState(ResultProxy::COLUMNS_FETCHED);
 			$this->query = null;
 			$this->ready();
+			$this->result->updateState(ResultProxy::COLUMNS_FETCHED);
 
 			return;
 		}
@@ -642,16 +664,16 @@ class Processor {
 			$column["original_table"] = DataTypes::decodeStringOff($packet, $off);
 			$column["name"] = DataTypes::decodeStringOff($packet, $off);
 			$column["original_name"] = DataTypes::decodeStringOff($packet, $off);
-			$fixlen = DataTypes::decodeIntOff($packet, $off);
+			$fixlen = DataTypes::decodeUnsignedOff($packet, $off);
 
 			$len = 0;
-			$column["charset"] = DataTypes::decode_int16(substr($packet, $off + $len));
+			$column["charset"] = DataTypes::decode_unsigned16(substr($packet, $off + $len));
 			$len += 2;
-			$column["columnlen"] = DataTypes::decode_int32(substr($packet, $off + $len));
+			$column["columnlen"] = DataTypes::decode_unsigned32(substr($packet, $off + $len));
 			$len += 4;
 			$column["type"] = ord($packet[$off + $len]);
 			$len += 1;
-			$column["flags"] = DataTypes::decode_int16(substr($packet, $off + $len));
+			$column["flags"] = DataTypes::decode_unsigned16(substr($packet, $off + $len));
 			$len += 2;
 			$column["decimals"] = ord($packet[$off + $len]);
 			//$len += 1;
@@ -661,21 +683,21 @@ class Processor {
 			$column["table"] = DataTypes::decodeStringOff($packet, $off);
 			$column["name"] = DataTypes::decodeStringOff($packet, $off);
 
-			$collen = DataTypes::decodeIntOff($packet, $off);
+			$collen = DataTypes::decodeUnsignedOff($packet, $off);
 			$column["columnlen"] = DataTypes::decode_intByLen(substr($packet, $off), $collen);
 			$off += $collen;
 
-			$typelen = DataTypes::decodeIntOff($packet, $off);
+			$typelen = DataTypes::decodeUnsignedOff($packet, $off);
 			$column["type"] = DataTypes::decode_intByLen(substr($packet, $off), $typelen);
 			$off += $typelen;
 
 			$len = 1;
-			$flaglen = $this->capabilities & self::CLIENT_LONG_FLAG ? DataTypes::decodeInt(substr($packet, $off, 9), $len) : ord($packet[$off]);
+			$flaglen = $this->capabilities & self::CLIENT_LONG_FLAG ? DataTypes::decodeUnsigned(substr($packet, $off, 9), $len) : ord($packet[$off]);
 			$off += $len;
 
 			if ($flaglen > 2) {
 				$len = 2;
-				$column["flags"] = DataTypes::decode_int16(substr($packet, $off, 4));
+				$column["flags"] = DataTypes::decode_unsigned16(substr($packet, $off, 4));
 			} else {
 				$len = 1;
 				$column["flags"] = ord($packet[$off]);
@@ -694,17 +716,17 @@ class Processor {
 	private function successfulResultsetFetch() {
 		$deferred = &$this->result->next;
 		if ($this->connInfo->statusFlags & StatusFlags::SERVER_MORE_RESULTS_EXISTS) {
-			$this->packetCallback = [$this, "handleQuery"];
+			$this->parseCallback = [$this, "handleQuery"];
 			$this->deferreds[] = $deferred ?: $deferred = new Deferred;
 		} else {
 			if (!$deferred) {
 				$deferred = new Deferred;
 			}
 			$deferred->succeed();
+			$this->parseCallback = null;
+			$this->query = null;
+			$this->ready();
 		}
-		$this->parseCallback = null;
-		$this->query = null;
-		$this->ready();
 		$this->result->updateState(ResultProxy::ROWS_FETCHED);
 	}
 
@@ -779,18 +801,18 @@ class Processor {
 		}
 		$off = 1;
 
-		$stmtId = DataTypes::decode_int32(substr($packet, $off));
+		$stmtId = DataTypes::decode_unsigned32(substr($packet, $off));
 		$off += 4;
 
-		$columns = DataTypes::decode_int16(substr($packet, $off));
+		$columns = DataTypes::decode_unsigned16(substr($packet, $off));
 		$off += 2;
 
-		$params = DataTypes::decode_int16(substr($packet, $off));
+		$params = DataTypes::decode_unsigned16(substr($packet, $off));
 		$off += 2;
 
 		$off += 1; // filler
 
-		$this->connInfo->warnings = DataTypes::decode_int16(substr($packet, $off));
+		$this->connInfo->warnings = DataTypes::decode_unsigned16(substr($packet, $off));
 
 		$this->result = new ResultProxy;
 		$this->result->columnsToFetch = $params;
@@ -965,9 +987,9 @@ class Processor {
 				$inflated = "";
 			}
 
-			$size = DataTypes::decode_int24($buf);
+			$size = DataTypes::decode_unsigned24($buf);
 			$this->compressionId = ord($buf[3]);
-			$uncompressed = DataTypes::decode_int24(substr($buf, 4, 3));
+			$uncompressed = DataTypes::decode_unsigned24(substr($buf, 4, 3));
 
 			$buf = substr($buf, 7);
 
@@ -1005,7 +1027,7 @@ class Processor {
 					$parsed = [];
 				}
 
-				$len = DataTypes::decode_int24($buf);
+				$len = DataTypes::decode_unsigned24($buf);
 				$this->seqId = ord($buf[3]);
 				$buf = substr($buf, 4);
 
@@ -1089,9 +1111,6 @@ class Processor {
 			switch (ord($packet)) {
 				case self::OK_PACKET:
 					$this->handleOk($packet);
-					break;
-				case self::LOCAL_INFILE_REQUEST:
-					$this->handleLocalInfileRequest($packet);
 					break;
 				case self::ERR_PACKET:
 					$this->handleError($packet);

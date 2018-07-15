@@ -7,7 +7,7 @@ class ResultProxy {
 	public $columns = [];
 	public $params = [];
 	public $columnsToFetch;
-	public $rows = null;
+	public $rows = [];
 	public $fetchedRows = 0;
 	public $userFetched = 0;
 	public $deferreds = [self::SINGLE_ROW_FETCH => [], self::COLUMNS_FETCHED => [], self::ROWS_FETCHED => []];
@@ -42,9 +42,9 @@ class ResultProxy {
 		if ($row !== null) {
 			$this->rows[$this->fetchedRows++] = $row;
 		}
-		list($key, list($entry, , $cb)) = each($this->deferreds[ResultProxy::SINGLE_ROW_FETCH]);
-		if ($key !== null) {
-			unset($this->deferreds[ResultProxy::SINGLE_ROW_FETCH][$key]);
+		list($entry, , $cb) = current($this->deferreds[ResultProxy::SINGLE_ROW_FETCH]);
+		if ($entry !== null) {
+			unset($this->deferreds[ResultProxy::SINGLE_ROW_FETCH][key($this->deferreds[ResultProxy::SINGLE_ROW_FETCH])]);
 			$entry->succeed($cb && $row ? $cb($row) : $row);
 		}
 	}
@@ -53,7 +53,7 @@ class ResultProxy {
 		$tmp = clone $this;
 		foreach ($tmp->deferreds as &$type) {
 			foreach ($type as &$entry) {
-				$entry[2] = null;
+				unset($entry[0], $entry[2]);
 			}
 		}
 
